@@ -1,0 +1,314 @@
+// This file contains your Data Connector logic
+section power_bi_connector;
+
+//Version <COMPANY> Connector 2.1 ///////////////////////////////////////////////
+
+[DataSource.Kind="power_bi_connector", Publish="power_bi_connector.Publish"]
+
+
+shared power_bi_connector.Contents = Value.ReplaceType(main_query, getdata_gui);
+
+
+location_gui = type text meta[
+        Documentation.FieldCaption = "Location Id",
+        Documentation.FieldDescription = "Filter by location",
+        Docuementation.SampleValues = {"FRK"}
+        ];
+
+cve_filter = type list meta [
+        Documentation.FieldCaption = "CVE Priority",
+        Documentation.FieldDescription = "CVE Priority selection required if you wish to pull CVE data",
+        Documentation.AllowedValues = { "Critical", "High", "Medium", "Low","Do not pull CVE data"},
+        Documentation.Default = {"Critical", "High", "Medium", "Low", "Do not pull CVE data"}
+                            ];
+
+ getdata_gui = type function (
+
+    connection as (type text meta [
+        Documentation.FieldCaption = "Connection Protocol",
+        Documentation.FieldDescription = "Specify whether this connection is unsecured or uses SSL",
+        Documentation.AllowedValues = { "HTTP", "HTTPS"}
+    ]),
+
+    ip_address as (type text meta [
+        Documentation.FieldCaption = "Hostname / IP Address",
+        Documentation.FieldDescription = "Enter your <COMPANY> Hostname or IP address",
+        Documentation.SampleValues = {"10.0.0.101"}
+    ]),
+    
+    cve_data as (cve_filter),
+    optional location as (location_gui)
+   
+    )
+   as table meta [
+        Documentation.Name = "Configure <COMPANY> Request", 
+        Documentation.FieldDescription = "Use the fields below to define the parameters of your data request"
+        
+    ];
+
+
+
+ main_query = (connection, ip_address, cve_data as list, optional location as text) => 
+
+let
+    exact_match = "&category=product&match=exact",
+    ip = "://" & ip_address,
+    relative_path = "/<COMPANY>/api/v1/",
+    loc1 = if location is null then "" else if Text.Contains(location,"+") then Text.Replace(location,"+","&locationid=%2B") else "&locationid="&location,
+    loc2 = if location is null then "" else if Text.Contains(location,"+") then Text.Replace(location,"+","?locationid=%2B") else "?locationid="&location,
+    locback1 = if location is null then "" else if Text.Contains(loc1,"%2B") then Text.Replace(location,"%2B","+") else location,
+    protocol = Text.Lower(connection),
+    
+    // CVE Priority Filter Logic
+    #"Convert CVE to Table" = Table.FromList(cve_data, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    #"Convert to string" = Text.Combine(#"Convert CVE to Table"[Column1], ","),
+    #"Convert to lower case"= Text.Lower(#"Convert to string"),
+    cve_filtered = if cve_data is null then "" else if #"Convert to lower case" ="critical,high,medium,low" then "" else "priority=" & #"Convert to lower case" &"&",
+
+devices = (
+
+        let
+       
+            function =  (offset as text) =>
+
+
+                let
+                    next_offset = (offset & "0000"),
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "devices?count=55000&offset="& next_offset & loc1)) otherwise error "Unexpected Error",
+                    Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source,
+                    #"Converted to table" = Table.FromRecords({Trigger}),
+                    #"Expanded list column" = Table.ExpandListColumn(#"Converted to table", "data")
+                    
+                in
+                    #"Expanded list column",
+                         
+            paging =
+
+                let
+                    
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "devices"& loc2)) otherwise error "Unexpected Error",
+                    Nullify = if List.IsEmpty(Source[data]) then error "No data found" else Source,
+                    Trigger = if Record.HasFields(Nullify, "log") then error "You have entered an invalid location ID" else Source,
+                    #"Page list" = try {0..Number.RoundUp(Trigger[info][#"total"] / Trigger[info][#"next_offset"])} otherwise {0},
+                    #"Converted to table" = Table.FromList(#"Page list", Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+                    #"Renamed columns" = Table.RenameColumns(#"Converted to table",{{"Column1", "Page"}}),
+                    #"Changed type" = Table.TransformColumnTypes(#"Renamed columns",{{"Page", type text}}),
+                    #"Invoked custom function" = Table.AddColumn(#"Changed type", "GetPage", each if [Page] <> null then function([Page]) else null),
+                    #"Expanded GetPage" = Table.ExpandTableColumn(#"Invoked custom function", "GetPage", {"data"}, {"data"}),
+                    #"Expanded data" = Table.ExpandRecordColumn(#"Expanded GetPage", "data", {"deviceRef", "deviceId", "hostedOn", "name", "description", "installationDate", "stage", "serialNumber", "last_seen", "zone", "safety", "release", "criticality", "modified", "exposure", "hardware", "context", "extended", "last_seen_by"}, {"Reference", "ID", "HostedOn", "Name", "Description", "InstallationDate", "Stage", "SerialNumber", "last_seen", "Zone", "Safety", "Release", "Criticality", "Modified", "Exposure", "Hardware", "Context", "DEV Extended", "last_seen_by"}),
+                    #"Expanded hardware" = Table.ExpandRecordColumn(#"Expanded data", "Hardware", {"vendor", "model", "type", "version", "orderNumber", "vendorLink", "description", "endOfLife", "lifecycle"}, {"Vendor", "Model", "Type", "Version", "Order Number", "Vendor Link", "HW Description", "End of Life", "Lifecycle"}),
+                    #"Expanded context" = Table.ExpandRecordColumn(#"Expanded hardware", "Context", {"location", "locationId", "referenceLocation", "otSystem", "deviceGroup"}, {"Location", "Location ID", "Reference Location", "OT System", "Device Group"}),
+                    #"Added profile" = Table.AddColumn(#"Expanded context", "Profile", each if [ID] = null then null else protocol & ip &"/<COMPANY>/profile.phtml?reference=" & [Reference]),
+                    #"Remove page1" = Table.RemoveColumns(#"Added profile","Page"),
+                    #"Reordered Columns" = Table.ReorderColumns(#"Remove page1",{"Reference", "ID", "HostedOn", "Name", "Description", "InstallationDate", "Stage", "SerialNumber", "last_seen", "Zone", "Safety", "Release", "Criticality", "Modified", "Exposure", "Vendor", "Model", "Type", "Version", "Order Number", "Vendor Link", "HW Description", "End of Life", "Lifecycle", "Location", "Location ID", "Reference Location", "OT System", "Device Group", "last_seen_by", "DEV Extended","Profile"}),
+                    #"Removed blanks"= Table.SelectRows(#"Reordered Columns", each ([ID] <> null)),
+                    #"Expand extended" = if Table.Contains(#"Removed blanks",[#"DEV Extended" = null]) then Table.RemoveColumns(#"Removed blanks", "DEV Extended") else
+                                        Table.ExpandRecordColumn(#"Removed blanks", "DEV Extended",
+                                 Record.FieldNames(#"Removed blanks"{0}[DEV Extended]),
+                                 Record.FieldNames(#"Removed blanks"{0}[DEV Extended]))
+                                   
+                    
+     
+                in
+                 #"Expand extended"
+
+             
+
+            in
+               paging),
+   
+
+    software = (
+
+        let
+            function = (offset as text) =>
+
+                let
+                    next_offset = (offset & "0000"),
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "software?count=55000&offset="& next_offset & loc1)) otherwise error "Unexpected Error",
+                    Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source,
+                    #"Converted to table" = Table.FromRecords({Trigger}),
+                    #"Expanded list column" = Table.ExpandListColumn(#"Converted to table", "data")
+                    
+                    in
+                        #"Expanded list column",
+            paging =
+
+                let
+
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "software"& loc2)) otherwise error "Unexpected Error",
+                    #"Page list" = try {0..Number.RoundUp(Source[info][#"total"] / Source[info][#"next_offset"])} otherwise {0},
+                    #"Converted to table" = Table.FromList(#"Page list", Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+                    #"Renamed columns" = Table.RenameColumns(#"Converted to table",{{"Column1", "Page"}}),
+                    #"Changed type" = Table.TransformColumnTypes(#"Renamed columns",{{"Page", type text}}),
+                    #"Invoked custom function" = Table.AddColumn(#"Changed type", "GetPage", each if [Page] <> null then function([Page]) else null),
+                    #"Expanded GetPage" = Table.ExpandTableColumn(#"Invoked custom function", "GetPage", {"data"}, {"data"}),
+                    #"Expanded record column" = Table.ExpandRecordColumn(#"Expanded GetPage", "data", {"vendor", "name", "version", "category", "type", "endOfSupport", "safety", "description", "lifecycle", "vendorLink", "installations"}, {"Vendor", "Name", "Version", "Category", "Type", "End of Support", "Safety", "Description", "Lifecycle", "Vendor Link", "Installations"}),
+                    #"Expanded installations" = Table.ExpandListColumn(#"Expanded record column", "Installations"),
+                    #"Changed Type" = Table.TransformColumnTypes(#"Expanded installations",{{"Vendor", type text}, {"Name", type text}, {"Version", type text}, {"Category", type text}, {"Type", type text}, {"End of Support", type text}, {"Safety", type any}, {"Description", type any}, {"Lifecycle", type text}, {"Vendor Link", type any}, {"Installations", type any}}),
+                    #"Added profile" = Table.AddColumn(#"Changed Type", "Profile", each if [Name] = null then null else protocol & ip &"/<COMPANY>/profile.phtml?search=" & (if Text.Contains([Name],"+") then Text.Replace([Name],"+","%2B") else [Name]) & "&version=" & [Version] & exact_match ),
+ 
+                    #"Removed page" = Table.RemoveColumns(#"Added profile", "Page"),
+                    #"Removed blanks"= Table.SelectRows(#"Removed page", each ([Name] <> null))
+                    
+     
+                in
+                 #"Removed blanks"
+                       
+
+        in
+            paging),
+            
+    hardware = (
+        
+        let
+            function = (offset as text) => 
+                
+                let
+                    next_offset = (offset & "000"),
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "hardware?count=55000&offset="& next_offset & loc1)) otherwise error "Unexpected Error",
+                    Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source,
+                    #"Converted to table" = Table.FromRecords({Trigger}),
+                    #"Expanded list column" = Table.ExpandListColumn(#"Converted to table", "data")
+
+                in
+                    #"Expanded list column",
+
+            paging = 
+            
+                let
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "hardware"& loc2)) otherwise error "Unexpected Error",
+                    Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source,
+                    #"Page list" = try {0..Number.RoundUp(Trigger[info][#"total"] / Trigger[info][#"next_offset"])} otherwise {0},
+                    #"Converted to table" = Table.FromList(#"Page list", Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+                    #"Renamed columns" = Table.RenameColumns(#"Converted to table",{{"Column1", "Page"}}),
+                    #"Changed type" = Table.TransformColumnTypes(#"Renamed columns",{{"Page", type text}}),
+                    #"Invoked custom function" = Table.AddColumn(#"Changed type", "GetPage", each if [Page] <> null then function([Page]) else null),
+                    #"Expanded GetPage" = Table.ExpandTableColumn(#"Invoked custom function", "GetPage", {"data"}, {"data"}),
+                    #"Expanded records" = Table.ExpandRecordColumn(#"Expanded GetPage", "data", {"vendor", "vendorLink", "model", "type", "version", "orderNumber", "description", "endOfLife", "safety", "lifecycle", "comment", "installations"}, {"Vendor", "Vendor Link", "Model", "Type", "Version", "Order Number", "Description", "EndOfLife", "Safety", "Lifecycle", "Comment", "Installations"}),                  
+                    #"Expanded installations" = Table.ExpandListColumn(#"Expanded records", "Installations"),
+                    #"Added profile" = Table.AddColumn(#"Expanded installations", "Profile", each if [Model] = null then null else protocol & ip &"/<COMPANY>/profile.phtml?search=" & (if Text.Contains([Model],"+") then Text.Replace([Model],"+","%2B") else [Model]) & "&version=" & [Version] & exact_match),
+                    #"Removed page" = Table.RemoveColumns(#"Added profile", "Page"),
+                     #"Removed blanks"= Table.SelectRows(#"Removed page", each ([Vendor] <> null))
+     
+                in
+                 #"Removed blanks"
+
+        in
+            
+            paging),
+
+vulnerabilities = (
+
+        let
+            function = (offset as text) =>
+                
+                let
+                    next_offset = (offset & "0000"),
+                    Source = try Json.Document(Web.Contents(protocol & ip & relative_path & "vulnerabilities?"& cve_filtered &"count=55000&offset=" & next_offset & loc1)) otherwise error "Unexpected Error",
+                    Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source,
+                    #"Converted to table" = Table.FromRecords({Trigger}),
+                    #"Expanded list column" = Table.ExpandListColumn(#"Converted to table", "data")
+                    
+               in
+                    #"Expanded list column",
+       
+           paging = 
+
+   
+               let
+                    Source =  try Json.Document(Web.Contents(protocol & ip & relative_path & "vulnerabilities?"& loc2)) otherwise error "Unexpected Error",  
+                   #"Page list" = try {0..Number.RoundUp(Source[info][#"total"] / Source[info][#"next_offset"])} otherwise {0},
+                    #"Converted to table" = Table.FromList(#"Page list", Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+                    #"Renamed columns" = Table.RenameColumns(#"Converted to table",{{"Column1", "Page"}}),
+                    #"Changed type" = Table.TransformColumnTypes(#"Renamed columns",{{"Page", type text}}),
+                    #"Invoked custom function" = Table.AddColumn(#"Changed type", "GetPage", each if [Page] <> null then function([Page]) else null),
+                    #"Expanded GetPage" = Table.ExpandTableColumn(#"Invoked custom function", "GetPage", {"data"}, {"data"}),
+                    #"Expanded records" = Table.ExpandRecordColumn(#"Expanded GetPage", "data", {"cveId", "kev", "baseScore", "severity", "priority", "datePublished", "vector", "description","devices"}, {"ID", "KEV", "Base Score", "Severity", "Priority", "Date Published", "Vector", "Description","Devices"}),               
+                   #"Expanded devices" = Table.ExpandListColumn(#"Expanded records", "Devices"),
+                   //#"Removed bad rows" = Table.SelectRows(#"Expanded devices", each Text.Contains([Devices], loc)),
+                   #"Added profile" = Table.AddColumn(#"Expanded devices", "Profile", each if [ID] = null then null else protocol & ip &"/<COMPANY>/profile.phtml?search=" & [ID] & "&category=cve"),
+                   #"Changed type2" = Table.TransformColumnTypes(#"Added profile",{{"ID", type text}, {"KEV", type text}, /*{"Base Score", type text},*/ {"Severity", type text}, {"Priority", type text}, {"Date Published", type date}, {"Vector", type text}, {"Description", type text}, {"Devices", type text}, {"Profile", type text}}),
+                  #"Removed page" = Table.RemoveColumns(#"Changed type2", "Page"),
+                  #"Removed blanks"= Table.SelectRows(#"Removed page", each ([ID] <> null)),
+                  #"Removed device blanks"= Table.SelectRows(#"Removed page", each ([Devices] <> null))
+                  
+                in
+                    #"Removed device blanks"                                
+    in 
+        paging),
+ 
+
+ nav_table = if devices is null then error "No devices returned from host" 
+         
+
+             else if not List.Contains(cve_data, "Do not pull CVE data")  then 
+
+                #table(
+                {"Name",          "Key",          "Data",      "ItemKind",  "ItemName",      "IsLeaf"},{
+                {"Devices",      "Devices",       devices,    "Table",     "Table",        true},
+                {"Software",      "Software",      software,   "Table",     "Table",        true},
+                {"Hardware",      "Hardware",      hardware,    "Table",    "Table",        true},
+                {"Vulnerabilities","Vulnerabilities", vulnerabilities,"Table", "Table",     true}
+            })
+
+
+            else #table(
+                {"Name",          "Key",          "Data",      "ItemKind",  "ItemName",      "IsLeaf"},{
+                {"Devices",      "Devices",       devices,    "Table",     "Table",        true},
+                {"Software",      "Software",      software,   "Table",     "Table",        true},
+                {"Hardware",      "Hardware",      hardware,    "Table",    "Table",        true}
+            }),
+
+         Output = Table.ToNavigationTable(nav_table, {"Key"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
+
+ in 
+    
+ Output  ;
+
+
+
+power_bi_connector = [
+    Authentication = [
+        UsernamePassword = []
+    ],
+    Label = ("Enter <COMPANY> Credentials")
+];
+
+power_bi_connector.Publish = [
+    Beta = false,
+    Category = "Other",
+    ButtonText = {"<COMPANY>", "Connect to <COMPANY> Asset Center" },
+    SourceImage = power_bi_connector.Icons,
+    SourceTypeImage = power_bi_connector.Icons
+];
+
+power_bi_connector.Icons = [
+    Icon16 = { Extension.Contents("power_bi_connector.216.png"), Extension.Contents("power_bi_connector.220.png"), Extension.Contents("power_bi_connector.224.png"), Extension.Contents("power_bi_connector.232.png") },
+    Icon32 = { Extension.Contents("power_bi_connector.232.png"), Extension.Contents("power_bi_connector.240.png"), Extension.Contents("power_bi_connector.248.png"), Extension.Contents("power_bi_connector.264.png") }
+];
+
+// Table.ToNavigationTable Function
+
+shared Table.ToNavigationTable = (
+    table as table,
+    keyColumns as list,
+    nameColumn as text,
+    dataColumn as text,
+    itemKindColumn as text,
+    itemNameColumn as text,
+    isLeafColumn as text
+) as table =>
+    let
+        tableType = Value.Type(table),
+        newTableType = Type.AddTableKey(tableType, keyColumns, true) meta 
+        [
+            NavigationTable.NameColumn = nameColumn, 
+            NavigationTable.DataColumn = dataColumn,
+            NavigationTable.ItemKindColumn = itemKindColumn, 
+            Preview.DelayColumn = itemNameColumn, 
+            NavigationTable.IsLeafColumn = isLeafColumn
+        ],
+        navigationTable = Value.ReplaceType(table, newTableType)
+    in
+        navigationTable;
