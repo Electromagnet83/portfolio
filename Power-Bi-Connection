@@ -1,3 +1,6 @@
+//This is a Power Bi Custom data connector I wrote in Microsoft's M Language that pulls data from an API source. It includes a parameter selection screen, table selection screen, 
+and then performs a large number of table operations to prepare / prettify the resulting json data. 
+
 // This file contains your Data Connector logic
 section power_bi_connector;
 
