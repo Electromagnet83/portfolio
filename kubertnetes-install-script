@@ -1,7 +1,8 @@
 #!/bin/sh
+#####This is an example of a powershell installation script I wrote to spin up a kubernetes pod deployment version of an application. The install script will build temporary YAML files from scratch, which are then used to configure the pod/deployment, before they are then destroyed. #####
 
 ####################################################
-# <hidden> Asset Center version to install
+# <hidden> version to install
 ####################################################
 VER=7.00
 
