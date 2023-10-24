@@ -1,0 +1,201 @@
+#!/bin/sh
+
+####################################################
+# <hidden> Asset Center version to install
+####################################################
+VER=7.00
+
+####################################################
+# Ports for web service
+#
+# Make sure the ports are not used by other services
+# or running containers of the <hidden> Asset Center
+####################################################
+HTTPPORT=80
+HTTPSPORT=443
+
+# Base directory for asset center
+BASE_DIR=/var/<hidden>
+
+# Database backup directory
+BACKUP_DIR=$BASE_DIR/backup
+
+# Config directory
+CONFIG_DIR=$BASE_DIR/config
+
+# Import directory for the <hidden> Asset Discovery files
+IMPORT_DIR=$BASE_DIR/otb_import
+
+######################################################
+### Check for Minikube and Kubectl ###
+######################################################
+echo "[ Checking for required installations... ]"
+echo ""
+sleep 1
+if ! command -v minikube &> /dev/null; then
+    echo "Minikube is not installed."
+    echo ""
+    minikube_installed=false
+else
+    minikube_installed=true
+fi
+
+# Check if kubectl is installed
+if ! command -v kubectl &> /dev/null; then
+    echo "Kubectl is not installed."
+    echo ""
+    kubectl_installed=false
+else
+    kubectl_installed=true
+fi
+
+# Exit with error message if either or both are missing
+if [ "$minikube_installed" = false ] && [ "$kubectl_installed" = false ]; then
+    echo "Please install Minikube and Kubectl to continue."
+    exit 1
+elif [ "$minikube_installed" = false ]; then
+    echo "Please install Minikube to continue."
+    exit 1
+elif [ "$kubectl_installed" = false ]; then
+    echo "Please install Kubectl to continue."
+    exit 1
+fi
+
+echo "Minikube and Kubectl are already installed. Continuing installation. "
+echo ""
+
+######################################################
+# Create the persistent folders on Node if not present 
+# and set permission to 0777 (drwxrwxrwx)
+######################################################
+
+otbackup=/mnt/<hidden>-backup
+otconfig=/mnt/<hidden>-config
+otimport=/mnt/<hidden>-import
+
+# Check if the folder exists
+if ! minikube ssh cd $otbackup &>/dev/null; then
+  echo "[ Creating backup folder.. ]"
+
+# Create the folder
+  minikube ssh mkdir $otbackup && minikube ssh sudo chmod 0777 $otbackup
+  echo "Backup folder created successfully"
+  echo ""
+else
+  continue
+fi
+ 
+if ! minikube ssh cd $otconfig &>/dev/null; then
+  echo "[ Creating config folder.. ]"
+
+# Create the folder
+  minikube ssh mkdir $otconfig && minikube ssh sudo chmod 0777 $otconfig
+  echo "Config folder created successfully"
+  echo ""
+else
+  continue
+fi
+
+if ! minikube ssh cd $otimport &>/dev/null; then
+  echo "[ Creating import folder.. ]"
+
+# Create the folder
+  minikube ssh mkdir $otimport && minikube ssh sudo chmod 0777 $otimport
+  echo "Import folder created successfully"
+  echo ""
+else
+  continue
+fi
+
+####################################################
+# Load the Docker Image
+####################################################
+image_name=<hidden>
+
+# Check for existing image and perform backup
+if minikube ssh "docker images | grep <hidden>"  &>/dev/null; then
+  echo "Existing image found in Minikube"
+  echo "" 
+  echo "[ Creating backup... ]"
+  kubectl exec <hidden>-pod backup &>/dev/null
+  echo "Backup complete"
+  echo "" 
+  echo "[ Removing existing image... ]"
+  echo ""
+  kubectl delete pod <hidden>-pod &>/dev/null
+  minikube image rm $(minikube image ls | grep <hidden>)
+  echo "[ Loading new <hidden> image... ]"
+  minikube image load $image_name.$VER.tar
+  echo "<hidden> successfully updated to version $image_name:$VER"
+  echo "" 
+  sleep 1
+else
+  if echo "[ Loading <hidden> image.. ]"; then
+   minikube image load $image_name.$VER.tar
+   echo "Image $image_name:$VER successfully loaded into Minikube"
+   echo ""
+  else
+   echo ""
+   echo "Failed to load image $image_name:$VER into Minikube"
+   exit 1
+  fi
+fi 
+
+######################################################
+# Build the temporary yaml configuration files
+# These will be removed once installation complete
+######################################################
+echo "[ Building Kubernetes Deployment... ]"
+echo ""
+echo "[ Creating temporary configuration files... ]"
+echo ""
+
+sleep 1
+touch <hidden>-service.yml
+echo -e "apiVersion: v1\nkind: Service\nmetadata:\n  name: <hidden>-service\nspec:\n  selector:\n     app: <hidden>\n  type: NodePort\n  ports:\n    - protocol: TCP\n      port: 443\n      targetPort: 443" > <hidden>-service.yml
+echo "[ Building Service File... ]"
+echo ""
+sleep 1
+touch <hidden>-pv.yml
+echo -e "apiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: <hidden>-backup\n  labels:\n    type: local\nspec:\n  storageClassName: pv-<hidden>\n  capacity:\n    storage: 500Mi\n  accessModes:\n    - ReadWriteMany\n  hostPath:\n    path: "/mnt/<hidden>-backup"\n" > <hidden>-pv.yml
+echo -e "---\napiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: <hidden>-config\n  labels:\n    type: local\nspec:\n  storageClassName: pv-<hidden>\n  capacity:\n    storage: 500Mi\n  accessModes:\n    - ReadWriteMany\n  hostPath:\n    path: "/mnt/<hidden>-config"\n" >> <hidden>-pv.yml
+echo -e "---\napiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: <hidden>-import\n  labels:\n    type: local\nspec:\n  storageClassName: pv-<hidden>\n  capacity:\n    storage: 500Mi\n  accessModes:\n    - ReadWriteMany\n  hostPath:\n    path: "/mnt/<hidden>-import"" >> <hidden>-pv.yml
+echo "[ Building Persistent Volume File... ]"
+echo ""
+sleep 1
+touch <hidden>-pvc.yml
+echo -e "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: <hidden>-backuppvc\nspec:\n  storageClassName: pv-<hidden>\n  accessModes:\n    - ReadWriteMany\n  resources:\n    requests:\n      storage: 500Mi\n" > <hidden>-pvc.yml
+echo -e "---\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: <hidden>-configpvc\nspec:\n  storageClassName: pv-<hidden>\n  accessModes:\n    - ReadWriteMany\n  resources:\n    requests:\n      storage: 500Mi\n" >> <hidden>-pvc.yml
+echo -e "---\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: <hidden>-importpvc\nspec:\n  storageClassName: pv-<hidden>\n  accessModes:\n    - ReadWriteMany\n  resources:\n    requests:\n      storage: 500Mi" >> <hidden>-pvc.yml
+echo "[ Building Persistent Volueme Claim File... ]"
+echo ""
+sleep 1
+touch <hidden>-deployment.yml
+echo -e "apiVersion: v1\nkind: Pod\nmetadata:\n  name: <hidden>-pod\n  labels:\n    app: <hidden>\nspec:\n  containers:\n  - name: $image_name\n    image: $image_name:$VER\n    imagePullPolicy: Never\n    volumeMounts:\n    - mountPath: /var/otb_backup\n      name: ot-backup\n    - mountPath: /var/otb_config\n      name: ot-config\n    - mountPath: /var/otb_import\n      name: ot-import\n    ports:\n    - containerPort: 443\n  volumes:\n   - name: ot-backup\n     persistentVolumeClaim:\n       claimName: <hidden>-backuppvc\n   - name: ot-config\n     persistentVolumeClaim:\n        claimName: <hidden>-configpvc\n   - name: ot-import\n     persistentVolumeClaim:\n       claimName: <hidden>-importpvc" > <hidden>-deployment.yml
+echo "[ Building Pod Configuration File... ]"
+sleep 1
+echo ""
+echo "Successfully wrote configuration files"
+echo ""
+sleep 1
+echo "[ Creating <hidden> pod... ]"
+echo ""
+sleep 1
+kubectl apply -f <hidden>-service.yml
+kubectl apply -f <hidden>-pv.yml
+kubectl apply -f <hidden>-pvc.yml
+kubectl apply -f <hidden>-deployment.yml
+echo ""
+sleep 2
+echo "Pod successfully created"
+echo ""
+echo "[ Removing temporary files... ]"
+rm <hidden>-deployment.yml
+rm <hidden>-pv.yml
+rm <hidden>-pvc.yml
+rm <hidden>-service.yml
+sleep 1
+echo ""
+echo "################################################################################################"
+echo "####### You can now access your <hidden> instance via ' minikube service <hidden>-service ' ########"
+echo "################################################################################################"
