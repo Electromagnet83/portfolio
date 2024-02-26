@@ -1,1 +1,492 @@
-https://github.com/Electromagnet83/Power-BI-3.0.git
+
+// This file contains your Data Connector logic
+section OT_Base_Connector;
+
+// OTbase Connector Version 3.0.1 //
+
+[DataSource.Kind="OT_Base_Connector", Publish="OT_Base_Connector.Publish"]
+
+shared OT_Base_Connector.Contents = Value.ReplaceType(getPayload, getdata_gui);
+
+location_gui = type text meta[
+        Documentation.FieldCaption = "Location Id",
+        Documentation.FieldDescription = "Filter by location",
+        Documentation.SampleValues = {"FRK"}
+        ];
+                           
+data_types = type list meta [
+        Documentation.FieldCaption = "Data Types",
+        Documentation.FieldDescription = "Select the API endpoints to pull data from",
+        Documentation.AllowedValues = { "Devices","Hardware","Software","Vulnerabilities"}
+                            ];
+
+cve_filter = type list meta [
+        Documentation.FieldCaption = "CVE Priority",
+        Documentation.FieldDescription = "CVE Priority selection required if you wish to pull CVE data",
+        Documentation.AllowedValues = { "Critical", "High", "Medium", "Low"}
+        ];
+test = type text meta [
+Documentation.FieldCaption = "TESTING THIS OUT",
+Documentation.AllowedValues = ""];
+
+getdata_gui = type function (
+
+    connection as (type text meta [
+        Documentation.FieldCaption = "Connection Protocol",
+        Documentation.FieldDescription = "For SSL, you must have a self-signed certificate installed locally",
+        Documentation.AllowedValues = { "HTTP", "HTTPS"}
+    ]),
+
+    ip_address as (type text meta [
+        Documentation.FieldCaption = "Hostname / IP Address",
+        Documentation.FieldDescription = "Enter your OTbase Hostname or IP address",
+        Documentation.SampleValues = {"10.0.0.101"}
+    ]),
+    
+    
+    device_select as (data_types),
+    optional cve_data as (cve_filter),
+    optional location as (location_gui)
+   
+    )
+   as table meta [
+        Documentation.Name = "Configure OTbase Request"
+        
+    ];
+
+getPayload =  (connection as text, ip_address as text, device_select as list, optional cve_data as list, optional location as text) as table =>
+    let
+        // Define Parameters
+
+        protocol = Text.Lower(connection),
+        relative_path = protocol & "://" & ip_address & "/ot-base/api/v1/",
+        loc1 = if location is null then "" else if Text.Contains(location,"+") then Text.Replace(location,"+","&locationid=%2B") else "&locationid=" & location,
+        convertCVEToTable = Table.FromList(cve_data, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+        convertToString = Text.Combine(convertCVEToTable[Column1], ","),
+        convertToLowerCase = Text.Lower(convertToString),
+        cve_filtered = if cve_data is null then "" else if convertToLowerCase = "critical,high,medium,low" then "" else "priority=" & convertToLowerCase & "&",
+        convertDeviceTypesToTable = Table.FromList(device_select, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+        convertDeviceToString = Text.Combine(convertDeviceTypesToTable[Column1], ","),
+        convertDeviceToLowerCase = Text.Lower(convertDeviceToString),
+
+FetchAllData = () => 
+    let
+        FetchPage = (offset) =>
+            let
+                Source = try Json.Document(Web.Contents(relative_path & "devices?include=compliance" & loc1 & "&offset=" & Text.From(offset))) otherwise error "Dx001",
+                Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source
+            in
+                Trigger,
+
+        GetAllPages = List.Generate(
+                () => [Result = FetchPage(0), Offset = 0],
+                each [Result] <> null and Record.HasFields([Result], "info") and [Offset] < [Result][info][total],
+                each let
+                        HasNextOffset = Record.HasFields([Result][info], "next_offset"),
+                        NextOffset = if HasNextOffset then [Result][info][next_offset] else null,
+                        NewResult = if HasNextOffset then FetchPage(NextOffset) else null,
+                        NewOffset = if HasNextOffset then NextOffset else [Offset]
+                    in
+                        [Result = NewResult, Offset = NewOffset]
+            ),
+        
+        CombinedResults = List.Transform(GetAllPages, each [Result][data]),
+        jsonObject = List.Accumulate(CombinedResults, {}, (state, current) => state & current)
+    in
+        jsonObject,
+GetDeviceData = () =>
+    let
+        RawData = FetchAllData(),
+        convertedToTable = Table.FromRecords(RawData),
+        removeColumns = Table.RemoveColumns(convertedToTable, {"connections","tags","monitors","compliance"}),
+        renameColumns = Table.RenameColumns(
+                removeColumns, 
+             {
+                    {"deviceRef", "Reference"}, 
+                    {"deviceId", "Device ID"}, 
+                    {"hostedOn", "Hosted On"}, 
+                    {"name", "Name"}, 
+                    {"description", "Description"}, 
+                    {"installationDate", "Installation Date"}, 
+                    {"stage", "Stage"}, 
+                    {"serialNumber", "Serial Number"}, 
+                    {"last_seen", "Last Seen"},
+                    {"warranty", "Warranty"},
+                    {"manufactureDate", "Manufacture Date"},
+                    {"zone", "Zone"}, 
+                    {"safety", "Safety"}, 
+                    {"release", "Release"},
+                    {"documentation","Documentation"},
+                    {"criticality", "Criticality"}, 
+                    {"modified", "Modified"}, 
+                    {"exposure", "Exposure"}, 
+                    {"hardware", "Hardware"},
+                    {"context", "Context"}, 
+                    {"os_firmware", "OS / Firmware"}, 
+                    {"last_seen_by", "Last Seen By"}
+                }
+        ),
+        expandedHardware = Table.ExpandRecordColumn(renameColumns, "Hardware", {"vendor", "model", "type", "version", "orderNumber", "vendorLink", "description", "endOfLife", "lifecycle"}, {"Vendor", "Model", "Type", "Version", "Order Number", "Vendor Link", "HW Description", "End of Life", "Lifecycle"}),
+        expandedContext = Table.ExpandRecordColumn(expandedHardware, "Context", {"location", "locationId", "referenceLocation", "otSystem", "deviceGroup"}, {"Location", "Location ID", "Reference Location", "OT System", "Device Group"}),   
+        addedProfile = Table.AddColumn(expandedContext, "Profile", each if [#"Device ID"] = null then null else protocol & "://" & ip_address &"/ot-base/profile.phtml?reference=" & [Reference]),
+        reorderedColumns = Table.ReorderColumns(addedProfile,{"Reference", "Device ID", "Hosted On", "Name", "Description", "Installation Date", "Stage", "Serial Number", "Last Seen", "Zone", "Safety", "Release", "Criticality", "Modified", "Exposure", "Vendor", "Model", "Type", "Version", "Order Number", "Vendor Link", "HW Description", "End of Life", "Lifecycle", "Location", "Location ID", "Reference Location","OT System", "Device Group", "Last Seen By","Profile"}),
+        removedBlanks = Table.SelectRows(reorderedColumns, each ([#"Device ID"] <> null)),
+        replaceNullsWithBlanks = Table.TransformColumns(
+                removedBlanks, 
+                List.Transform(
+                    Table.ColumnNames(removedBlanks), 
+                    (columnName) => {columnName, each if _ = null then "" else _}
+                )
+            ),
+        expandExtended = 
+            if Table.HasColumns(replaceNullsWithBlanks, "extended") then
+                if Table.Contains(replaceNullsWithBlanks, [#"extended" = null]) then 
+                    Table.RemoveColumns(replaceNullsWithBlanks, "extended") 
+                else 
+                    let
+                        ExtendedColumn = Table.ExpandRecordColumn(replaceNullsWithBlanks, "extended",
+                            Record.FieldNames(replaceNullsWithBlanks{0}[extended]),
+                            Record.FieldNames(replaceNullsWithBlanks{0}[extended]))
+                    in
+                        ExtendedColumn
+            else
+                replaceNullsWithBlanks
+
+        in
+            expandExtended,
+GetConnectionsData = () =>
+    let
+        RawData = FetchAllData(),
+        ConvertedToTable = Table.FromRecords(RawData),
+        ConnectionsData = Table.TransformColumns(ConvertedToTable, {"connections", each Table.FromRecords(_)}){0},
+        SelectedColumnTable = Table.SelectColumns(ConvertedToTable, {"deviceId", "connections"}),      
+        renameColumns = Table.RenameColumns(
+                SelectedColumnTable, 
+             {              
+                    {"deviceId", "Device ID"},
+                    {"connections","Connections"}
+                    
+                  
+                }
+        ),
+        expandedConnections = Table.ExpandListColumn(renameColumns, "Connections"),
+        expandedConnections2 = Table.ExpandRecordColumn(expandedConnections, "Connections", {"network", "networkId", "networkGroup", "medium", "L2Address", "L3Address", "networkAddress", "networkType", "port", "vlan", "counterpart", "remotePort", "remoteDesc", "ifName", "ifStatus", "ifDHCP", "speed", "duplex", "networkLocation", "networkLocationId"}, {"Network", "Network ID", "Network Group", "Medium", "L2 Address", "L3 Address", "Network Address", "Network Type", "Port", "Vlan", "Counterpart", "Remote Port", "Remot Description", "If Name", "ifStatus", "If DHCP", "Speed", "Duplex", "Network Location", "Network Location Id"}),  
+        removedBlanks = Table.SelectRows(expandedConnections2, each ([#"Network Type"] <> null)),
+        replaceNullsWithBlanks = Table.TransformColumns(
+                removedBlanks, 
+                List.Transform(
+                    Table.ColumnNames(removedBlanks), 
+                    (columnName) => {columnName, each if _ = null then "" else _}
+                )
+        )
+        
+        in
+            replaceNullsWithBlanks,
+GetDeviceTags = () =>
+    let
+        RawData = FetchAllData(),
+        ConvertedToTable = Table.FromRecords(RawData),
+        ConnectionsData = Table.TransformColumns(ConvertedToTable, {"tags", each Table.FromRecords(_)}){0},
+        SelectedColumnTable = Table.SelectColumns(ConvertedToTable, {"deviceId","tags"}),      
+        renameColumns = Table.RenameColumns(
+                SelectedColumnTable, 
+             {              
+                    {"deviceId", "Device ID"},
+                    {"tags","Tags"}           
+                  
+                }
+        ),
+        expandTags = Table.ExpandListColumn(renameColumns, "Tags"), 
+        removedBlanks = Table.SelectRows(expandTags, each ([Tags] <> null))
+    in
+        removedBlanks,
+GetDeviceMonitors = () =>
+    let
+        RawData = FetchAllData(),
+        ConvertedToTable = Table.FromRecords(RawData),
+        ConnectionsData = Table.TransformColumns(ConvertedToTable, {"monitors", each Table.FromRecords(_)}){0},
+        SelectedColumnTable = Table.SelectColumns(ConvertedToTable, {"deviceId","monitors"}),      
+        renameColumns = Table.RenameColumns(
+                SelectedColumnTable, 
+             {              
+                     {"deviceId", "Device ID"}
+                   
+                  
+                }
+        ),
+        expandMonitors = Table.ExpandListColumn(renameColumns, "monitors"),
+        expandMonitors2 = Table.ExpandRecordColumn(expandMonitors, "monitors", {"monitor_name", "last_scan", "last_version", "last_result", "last_seen"}, {"Monitor Name", "Monitor Last Scan", "Monitor Last Version", "Monitor Last Result", "Monitor Last Seen"}),
+        removedBlanks = Table.SelectRows(expandMonitors2, each ([#"Monitor Name"] <> null))
+    in
+        removedBlanks,
+GetComplianceData = () =>
+
+    let
+            RawData = FetchAllData(),
+            ConvertedToTable = Table.FromRecords(RawData),
+            ConnectionsData = Table.TransformColumns(ConvertedToTable, {"compliance", each Table.FromRecords(_)}){0},
+            SelectedColumnTable = Table.SelectColumns(ConvertedToTable, {"deviceId","compliance"}),      
+            renameColumns = Table.RenameColumns(
+                    SelectedColumnTable, 
+                 {              
+                         {"deviceId", "Device ID"}   
+                   
+                  
+                    }
+            ),
+            expandCompliance = Table.ExpandListColumn(renameColumns, "compliance"),
+            expandCompliance2 = Table.ExpandRecordColumn(expandCompliance, "compliance", {"policy", "description", "compliant"}, {"Policy", "Description", "Status"}),
+            replaceStatus = Table.TransformColumns(expandCompliance2, {"Status", each if _ = true then "Compliant" else if _ = false then "Non-Compliant" else null}),
+            removedBlanks = Table.SelectRows(replaceStatus, each ([Status] <> null))
+    in
+        removedBlanks,       
+GetHardwareData = () =>
+
+    let
+        FetchPage = (offset) =>
+            let
+                Source = try Json.Document(Web.Contents(relative_path & "hardware?" & "offset=" & Text.From(offset) & loc1)) otherwise error "Hx001",
+                Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source
+            in
+                Trigger,
+
+        GetAllPages = List.Generate(
+                () => [Result = FetchPage(0), Offset = 0],
+                each [Result] <> null and Record.HasFields([Result], "info") and [Offset] < [Result][info][total],
+                each let
+                        HasNextOffset = Record.HasFields([Result][info], "next_offset"),
+                        NextOffset = if HasNextOffset then [Result][info][next_offset] else null,
+                        NewResult = if HasNextOffset then FetchPage(NextOffset) else null,
+                        NewOffset = if HasNextOffset then NextOffset else [Offset]
+                    in
+                        [Result = NewResult, Offset = NewOffset]
+            ),
+
+        CombinedResults = List.Transform(GetAllPages, each [Result][data]),
+        FlattenedResults = List.Accumulate(CombinedResults, {}, (state, current) => state & current),
+        ConvertedToTable = Table.FromRecords(FlattenedResults),
+        renameColumns = Table.RenameColumns(
+                ConvertedToTable, 
+            {
+                {"vendor", "Vendor"}, 
+                {"vendorLink", "Vendor Link"}, 
+                {"model", "Model"}, 
+                {"type", "Type"}, 
+                {"version", "Version"}, 
+                {"orderNumber", "Order Number"}, 
+                {"description", "Description"}, 
+                {"endOfLife", "End Of Life"},
+                {"safety", "Safety"}, 
+                {"lifecycle", "Lifecycle"}, 
+                {"comment", "Comment"}, 
+                {"installations", "Device ID"}
+            }
+        ),
+        expandedInstallations = Table.ExpandListColumn(renameColumns, "Device ID"),
+        //duplicateColumn = Table.AddColumn(expandedInstallations, "Device ID", each [Installations]),
+        addedProfile = Table.AddColumn(expandedInstallations, "Profile", each if [Model] = null then null else protocol & "://" & ip_address &"/ot-base/profile.phtml?search=" & (if Text.Contains([Model],"+") then Text.Replace([Model],"+","%2B") else [Model]) & "&version=" & [Version] & "&category=product&match=exact" ),
+        removedBlanks = Table.SelectRows(addedProfile, each ([Vendor] <> null)),
+        replaceNullsWithBlanks = Table.TransformColumns(
+                removedBlanks, 
+                List.Transform(
+                        Table.ColumnNames(removedBlanks), 
+                        (columnName) => {columnName, each if _ = null then "" else _}
+                    )
+        ),
+        reorderedColumns = Table.ReorderColumns(replaceNullsWithBlanks, {"Device ID","Vendor","Vendor Link", "Model","Type","Version","Order Number","Description","End Of Life","Safety","Lifecycle","Comment"}),
+        expandExtended = 
+            if Table.HasColumns(replaceNullsWithBlanks, "extended") then
+                if Table.Contains(replaceNullsWithBlanks, [#"extended" = null]) then 
+                    Table.RemoveColumns(replaceNullsWithBlanks, "extended") 
+                else 
+                    let
+                        ExtendedColumn = Table.ExpandRecordColumn(replaceNullsWithBlanks, "extended",
+                            Record.FieldNames(replaceNullsWithBlanks{0}[extended]),
+                            Record.FieldNames(replaceNullsWithBlanks{0}[extended]))
+                    in
+                        ExtendedColumn
+            else
+                replaceNullsWithBlanks
+
+        
+       
+     
+            in
+                  
+              expandExtended,
+GetSoftwareData = () =>
+
+    let
+        FetchPage = (offset) =>
+            let
+                Source = try Json.Document(Web.Contents(relative_path & "software?"  & "offset=" & Text.From(offset) & loc1)) otherwise error "Sx001",
+                Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source
+            in
+                Trigger,
+
+        GetAllPages = List.Generate(
+                () => [Result = FetchPage(0), Offset = 0],
+                each [Result] <> null and Record.HasFields([Result], "info") and [Offset] < [Result][info][total],
+                each let
+                        HasNextOffset = Record.HasFields([Result][info], "next_offset"),
+                        NextOffset = if HasNextOffset then [Result][info][next_offset] else null,
+                        NewResult = if HasNextOffset then FetchPage(NextOffset) else null,
+                        NewOffset = if HasNextOffset then NextOffset else [Offset]
+                    in
+                        [Result = NewResult, Offset = NewOffset]
+            ),
+
+        CombinedResults = List.Transform(GetAllPages, each [Result][data]),
+        FlattenedResults = List.Accumulate(CombinedResults, {}, (state, current) => state & current),
+        ConvertedToTable = Table.FromRecords(FlattenedResults),
+        renameColumns = Table.RenameColumns(
+            ConvertedToTable, {
+                    {"vendor", "Vendor"},
+                    {"name", "Name"},
+                    {"version", "Version"},
+                    {"category", "Category"},
+                    {"type", "Type"},
+                    {"endOfSupport","End of Support"},
+                    {"safety","Safety"},
+                    {"description","Description"},
+                    {"lifecycle","Lifecycle"},
+                    {"vendorLink","Vendor Link"},
+                    {"installations","Device ID" }
+                }
+            ),
+        expandedInstallations = Table.ExpandListColumn(renameColumns, "Device ID"),
+        changedType2 = Table.TransformColumnTypes(expandedInstallations,{{"Vendor", type text}, {"Name", type text}, {"Version", type text}, {"Category", type text}, {"Type", type text}, {"End of Support", type text}, {"Safety", type any}, {"Description", type any}, {"Lifecycle", type text}, {"Vendor Link", type any}, {"Device ID", type any}}),
+        addedProfile = Table.AddColumn(changedType2, "Profile", each if [Name] = null then null else protocol &"://" & ip_address &"/ot-base/profile.phtml?search=" & (if Text.Contains([Name],"+") then Text.Replace([Name],"+","%2B") else [Name]) & "&version=" & [Version] & "&match=exact"),
+        removedBlanks = Table.SelectRows(addedProfile, each ([Name] <> null)),
+        reorderColumns = Table.ReorderColumns(removedBlanks, {"Device ID", "Name","Category","Description","Vendor","Vendor Link", "Version","Type","End of Support", "Safety","Lifecycle"})
+
+    in 
+        reorderColumns,
+GetVulnerabilityData = () =>
+
+    let
+        FetchPage = (offset) =>
+            let
+                Source = try Json.Document(Web.Contents(relative_path & "vulnerabilities?" & cve_filtered & "count=1000" & "&offset=" & Text.From(offset) & loc1)) otherwise error "Vx001",
+                Trigger = if Record.HasFields(Source, "log") then error "You have entered an invalid location ID" else Source
+            in
+                Trigger,
+
+        GetAllPages = List.Generate(
+                () => [Result = FetchPage(0), Offset = 0],
+                each [Result] <> null and Record.HasFields([Result], "info") and [Offset] < [Result][info][total],
+                each let
+                        HasNextOffset = Record.HasFields([Result][info], "next_offset"),
+                        NextOffset = if HasNextOffset then [Result][info][next_offset] else null,
+                        NewResult = if HasNextOffset then FetchPage(NextOffset) else null,
+                        NewOffset = if HasNextOffset then NextOffset else [Offset]
+                    in
+                        [Result = NewResult, Offset = NewOffset]
+            ),
+
+        CombinedResults = List.Transform(GetAllPages, each [Result][data]),
+        FlattenedResults = List.Accumulate(CombinedResults, {}, (state, current) => state & current),
+        ConvertedToTable = Table.FromRecords(FlattenedResults),
+        renameColumns = Table.RenameColumns(
+            ConvertedToTable, {
+                    {"cveId", "CVE ID"}, 
+                    {"kev", "KEV"}, 
+                    {"baseScore", "Base Score"}, 
+                    {"severity", "Severity"}, 
+                    {"priority", "Priority"}, 
+                    {"datePublished", "Date Published"}, 
+                    {"vector", "Vector"}, 
+                    {"description", "Description"},
+                    {"devices", "Device ID"}
+                }
+        ),
+        expandedDevices = Table.ExpandListColumn(renameColumns, "Device ID"),
+        addedProfile = Table.AddColumn(expandedDevices, "Profile", each if [CVE ID] = null then null else protocol & "://" & ip_address &"/ot-base/profile.phtml?search=" & [CVE ID] & "&category=cve"),
+        changedType2 = Table.TransformColumnTypes(addedProfile,{{"CVE ID", type text}, {"KEV", type text}, {"Severity", type text}, {"Priority", type text}, {"Date Published", type date}, {"Vector", type text}, {"Description", type text}, {"Device ID", type text}, {"Profile", type text}}),
+        removedBlanks = Table.SelectRows(changedType2, each ([CVE ID] <> null)),
+        reorderedColumns = Table.ReorderColumns(removedBlanks, {"Device ID", "CVE ID", "Description", "KEV", "Base Score", "Severity","Priority", "Date Published", "Vector"})
+
+
+    in
+        reorderedColumns,
+
+CreateNavTable = (tableList as list) =>
+        let
+            filteredTableList = List.Select(tableList, each _[Data] <> null),
+            navTableEntries = List.Transform(filteredTableList, each {_[Name], _[Key], _[Data], "Table", "Table", true}),
+            navTable = #table({"Name", "Key", "Data", "ItemKind", "ItemName", "IsLeaf"}, navTableEntries),
+            Output = Table.ToNavigationTable(navTable, {"Key"}, "Name", "Data", "ItemKind", "ItemName" ,"IsLeaf")
+        in
+            Output,
+
+
+// Main Logic
+    
+DevicesData = if List.Contains(device_select,"Devices") then GetDeviceData() else null,     
+ConnectionsData = if DevicesData <> null then GetConnectionsData() else null,
+TagData = if DevicesData <> null then GetDeviceTags() else null,
+MonitorData = if DevicesData <> null then GetDeviceMonitors() else null,
+ComplianceData = if DevicesData <> null then GetComplianceData() else null,
+HardwareData = if List.Contains(device_select,"Hardware") then GetHardwareData() else null,
+SoftwareData = if List.Contains(device_select,"Software") then GetSoftwareData() else null,
+VulnerabilityData = if List.Contains(device_select,"Vulnerabilities") then  GetVulnerabilityData() else null,
+Output =   
+        CreateNavTable({          
+            [Name = "Devices", Key = "Devices", Data = DevicesData],
+            [Name = "Connections", Key = "Connections", Data = ConnectionsData],
+            [Name = "Tags", Key = "Tags", Data = TagData],
+            [Name = "Monitors", Key = "Monitors", Data = MonitorData],
+            [Name = "Compliance", Key = "Compliance", Data = ComplianceData],
+            [Name = "Hardware", Key = "Hardware", Data = HardwareData],
+            [Name = "Software", Key = "Software", Data = SoftwareData],
+            [Name = "Vulnerabilities", Key = "Vulnerabilities", Data = VulnerabilityData]
+            })
+    in
+        Output;
+        
+
+OT_Base_Connector = [
+    Authentication = [
+        UsernamePassword = []
+    ],
+    Label = ("Enter OTbase Credentials")
+];
+
+OT_Base_Connector.Publish = [
+    Beta = false,
+    Category = "Other",
+    ButtonText = {"OTbase", "Connect to OTbase Inventory" },
+    //LearnMoreUrl = "https://www.langner.com",
+    SourceImage = OT_Base_Connector.Icons,
+    SourceTypeImage = OT_Base_Connector.Icons
+];
+
+OT_Base_Connector.Icons = [
+    Icon16 = { Extension.Contents("OT_Base_RC3.216.png"), Extension.Contents("OT_Base_RC3.220.png"), Extension.Contents("OT_Base_RC3.224.png"), Extension.Contents("OT_Base_RC3.232.png") },
+    Icon32 = { Extension.Contents("OT_Base_RC3.232.png"), Extension.Contents("OT_Base_RC3.240.png"), Extension.Contents("OT_Base_RC3.248.png"), Extension.Contents("OT_Base_RC3.264.png") }
+];
+
+// Table.ToNavigationTable Function
+
+shared Table.ToNavigationTable = (
+    table as table,
+    keyColumns as list,
+    nameColumn as text,
+    dataColumn as text,
+    itemKindColumn as text,
+    itemNameColumn as text,
+    isLeafColumn as text
+) as table =>
+    let
+        tableType = Value.Type(table),
+        newTableType = Type.AddTableKey(tableType, keyColumns, true) meta 
+        [
+            NavigationTable.NameColumn = nameColumn, 
+            NavigationTable.DataColumn = dataColumn,
+            NavigationTable.ItemKindColumn = itemKindColumn, 
+            Preview.DelayColumn = itemNameColumn, 
+            NavigationTable.IsLeafColumn = isLeafColumn
+        ],
+        navigationTable = Value.ReplaceType(table, newTableType)
+    in
+        navigationTable;
