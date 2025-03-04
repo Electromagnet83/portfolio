@@ -1,7 +1,5 @@
 #!/usr/bin/env python
-# combined_diff_airtable.py
 import re
-import argparse
 import csv
 import json
 import requests
@@ -9,28 +7,37 @@ import pandas as pd
 import sys
 import os
 import datetime
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
+# -----------------------------
+# Constants for Airtable credentials
+# -----------------------------
+BASE_ID = "<>"
+TABLE_ID = "<>"
+API_TOKEN = "<>"
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
 def map_field(field):
-    """If field starts with 'Custom field', return the value inside parentheses; otherwise, return field unchanged."""
     m = re.match(r"Custom field\s*\((.+)\)", field)
     if m:
         return m.group(1).strip()
     return field
 
 def chunks(lst, n):
-    # Yield successive n-sized chunks from lst
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 def fetch_airtable_data(url, headers):
-    # Retrieve all records from Airtable (handling pagination) and return a list of records.
     all_records = []
     params = {}
     while True:
         response = requests.get(url, headers=headers, params=params)
         if response.status_code != 200:
-            print("Error fetching Airtable data:", response.text)
-            sys.exit(1)
+            messagebox.showerror("Error", f"Error fetching Airtable data:\n{response.text}")
+            return None
         data = response.json()
         all_records.extend(data.get("records", []))
         if "offset" in data:
@@ -39,16 +46,22 @@ def fetch_airtable_data(url, headers):
             break
     return all_records
 
+def detect_duplicate_keys(airtable_records):
+    freq = {}
+    duplicates = set()
+    for rec in airtable_records:
+        fields = rec.get("fields", {})
+        key = fields.get("Issue key")
+        if key:
+            freq[key] = freq.get(key, 0) + 1
+    for key, count in freq.items():
+        if count > 1:
+            duplicates.add(key)
+    return duplicates
+
 def backup_to_excel(records, backup_path):
-    """
-    Write the fetched Airtable records (each record's "fields" dict) to an Excel backup file.
-    Uses fixed column widths for columns A through E:
-      A = 13, B = 11, C = 15, D = 30, E = 60, F = 16.
-    Any additional columns are set to a default width of 20.
-    """
     data = [rec.get("fields", {}) for rec in records]
     df = pd.DataFrame(data)
-    
     with pd.ExcelWriter(backup_path, engine='xlsxwriter') as writer:
         df.to_excel(writer, sheet_name="Backup", index=False)
         workbook = writer.book
@@ -57,321 +70,506 @@ def backup_to_excel(records, backup_path):
         default_width = 20
         for idx, col in enumerate(df.columns):
             width = fixed_widths[idx] if idx < len(fixed_widths) else default_width
-            worksheet.set_column(idx, idx, width)       
+            worksheet.set_column(idx, idx, width)
     print("- Airtable backup Excel written to:", backup_path)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Pull current data from Airtable, compare it to NEW CSV file, generate diff log (Excel and JSON), and update Airtable via API."
-    )
-    parser.add_argument("--new", required=True, help="Path to the new CSV file")
-    parser.add_argument("--excel", required=True, help="Path for the output Excel workbook")
-    parser.add_argument("--json", required=True, help="Path for the output JSON file (changes payload)")
-    parser.add_argument("--backup", default="airtable_backup.xlsx", help="Base name for the Airtable backup Excel file")
-    parser.add_argument("--base_id", required=True, help="Airtable base ID")
-    parser.add_argument("--table", required=True, help="Airtable table name or ID")
-    parser.add_argument("--token", required=True, help="Airtable API token")
-    parser.add_argument("--preview", "-p", action="store_true",
-                        help="Perform all operations except the Airtable API upload (for customer preview)")
-    parser.add_argument("--upload", action="store_true",
-                        help="Skip diff generation; use an existing JSON payload for upload only")
-    args = parser.parse_args()
+def read_and_normalize_csv(csv_path):
+    rows = []
+    with open(csv_path, newline='', encoding='utf-8') as csvfile:
+        reader = csv.reader(csvfile)
+        headers = next(reader)
+        for row in reader:
+            row_dict = {}
+            for i, header in enumerate(headers):
+                key = header.strip()
+                value = row[i].strip() if i < len(row) else ""
+                if key:
+                    # Combine duplicate 'Labels' columns
+                    if key in row_dict and key == "Labels" and value:
+                        row_dict[key] = row_dict[key] + "," + value
+                    else:
+                        row_dict.setdefault(key, value)
+            rows.append(row_dict)
+    return rows
 
-    base_id = args.base_id
-    table_name = args.table
-    api_token = args.token
-    url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
+def build_old_data(airtable_records):
+    out = {}
+    for rec in airtable_records:
+        fields = rec.get("fields", {})
+        issue_key = fields.get("Issue key")
+        if issue_key:
+            out[issue_key] = fields
+    return out
 
-    # Today's date for the API update field.
-    today_date = datetime.datetime.now().strftime("%Y-%m-%d")
+def normalize_fix_versions(value):
+    if value.startswith("smartmls-connectmls-"):
+        return re.sub(r"^smartmls-connectmls-", "", value)
+    return value
 
-    if not args.upload:
-        if not (args.new and args.excel):
-            parser.error("Full mode requires --new and --excel arguments. Use --upload to skip diff generation.")
-        airtable_records = fetch_airtable_data(url, headers)
+def convert_created(csv_val):
+    try:
+        dt_csv = datetime.datetime.strptime(csv_val, "%d/%b/%y %I:%M %p")
+    except ValueError:
+        return csv_val
+    return dt_csv.strftime("%m-%d-%Y %H:%M")
 
-        # Convert fetched records into a dictionary keyed by "Issue key"
-        old_data = {}
-        for rec in airtable_records:
-            fields = rec.get("fields", {})
-            issue_key = fields.get("Issue key")
-            if issue_key:
-                old_data[issue_key] = fields
+def unify_bool(csv_val, old_val):
+    val_lower = csv_val.strip().lower()
+    if not val_lower:
+        return None, None
+    if val_lower == "yes":
+        new_val = True
+    elif val_lower == "no":
+        new_val = False
+    else:
+        return None, None
+    if isinstance(old_val, bool):
+        old_bool = old_val
+    elif isinstance(old_val, str):
+        low = old_val.strip().lower()
+        old_bool = True if low in ["yes", "true"] else False
+    else:
+        old_bool = False
+    return new_val, old_bool
 
-        changes = []            # For Change Log
-        changed_rows_count = 0  # Count of loggable changes to existing tickets
-        new_tickets_count = 0   # Count of new tickets (not in old_data)
-        records = []            # For JSON upsert payload
-        new_ticket_records = [] # For New Tickets worksheet
+def unify_old_bool(old_val):
+    if isinstance(old_val, bool):
+        return old_val
+    if isinstance(old_val, str):
+        low = old_val.strip().lower()
+        if low in ["yes","true"]:
+            return True
+    return False
 
-        # Include "Created" among fields to check.
-        fields_to_check = [
-            "Issue Type",
-            "Summary",
-            "Status",
-            "Custom field (T-Shirt Size)",
-            "Priority",
-            "Components",
-            "Custom field (Customer Reported)",
-            "Fix versions",
-            "Labels",
-            "Created"  # NEW: Include "Created"
-        ]
-        field_mapping = {
-            "Custom field (T-Shirt Size)": "T-shirt Size",
-            "Custom field (Customer Reported)": "Customer Reported"
-        }
+def unify_matrix_parity(labels, old_val):
+    new_val = "24rvw_matrix_parity" in labels
+    if isinstance(old_val, bool):
+        old_bool = old_val
+    elif isinstance(old_val, str):
+        low = old_val.strip().lower()
+        old_bool = True if low in ["yes", "true"] else False
+    else:
+        old_bool = False
+    return new_val, old_bool
 
-        # Read CSV and combine duplicate "Labels" columns.
-        csv_rows = []
-        with open(args.new, newline='', encoding='utf-8') as new_file:
-            reader = csv.reader(new_file)
-            headers_list = next(reader)
-            if "Issue key" not in headers_list:
-                print("Issue key column not found in new CSV header!")
-                sys.exit(1)
-            for row in reader:
-                row_dict = {}
-                for i, header in enumerate(headers_list):
-                    key = header.strip()
-                    value = row[i].strip() if i < len(row) else ""
-                    if key:
-                        if key in row_dict:
-                            if key == "Labels" and value:
-                                row_dict[key] = row_dict[key] + "," + value
-                        else:
-                            row_dict[key] = value
-                csv_rows.append(row_dict)
+def compare_record(csv_row, old_row, fields_to_check, field_mapping, last_updated, changelog):
+    record_fields = {}
+    record_changed = False
+    loggable_change = False
 
-        # Compute set of Jira issue keys from CSV.
-        jira_issue_keys = { row.get("Issue key", "") for row in csv_rows if row.get("Issue key", "") }
-        # Identify tickets in Airtable not present in the new Jira export.
-        smart_tickets_not_in_jira = [ old_data[k] for k in old_data if k not in jira_issue_keys ]
-        smart_not_count = len(smart_tickets_not_in_jira)
+    for field in fields_to_check:
+        mapped = field_mapping.get(field, field)
+        if mapped == "Created":
+            continue
+        csv_val = csv_row.get(mapped, csv_row.get(field, ""))
+        old_val = old_row.get(mapped, "")
+        
+        if mapped == "Fix versions":
+            csv_val = normalize_fix_versions(csv_val)
+        if mapped == "Resolution":
+            csv_val = csv_val.strip()
+            if not csv_val:
+                continue
+        elif mapped == "Customer Reported":
+            new_bool, old_bool = unify_bool(csv_val, old_val)
+            if new_bool is None:
+                continue
+            if new_bool != old_bool:
+                record_changed = True
+                record_fields[mapped] = new_bool
+                loggable_change = True
+                changelog.append({
+                    "Ticket Number": csv_row.get("Issue key", ""),
+                    "Column": mapped,
+                    "prev": old_bool,
+                    "new": new_bool
+                })
+            continue
 
-        # Process each CSV row.
-        for row_dict in csv_rows:
-            labels = row_dict.get("Labels", "")
-            new_quarter = ""
-            if "#2026" in labels:
-                new_quarter = "Q1_2026"
-            elif "#1_p_sm" in labels:
-                new_quarter = "Q1"
-            elif "#2_p_sm" in labels:
-                new_quarter = "Q2"
-            elif "#3_p_sm" in labels:
-                new_quarter = "Q3"
-            elif "#4_p_sm" in labels:
-                new_quarter = "Q4"
-            if new_quarter and new_quarter != "Q1_2026":
-                new_quarter = f"{new_quarter}_{datetime.datetime.now().strftime('%Y')}"
-            new_matrix = "Yes" if "24rvw_matrix_parity" in labels else "No"
+        if csv_val != old_val:
+            record_changed = True
+            record_fields[mapped] = csv_val
+            if mapped not in ["Labels", "Last Updated (API)"]:
+                loggable_change = True
+                changelog.append({
+                    "Ticket Number": csv_row.get("Issue key", ""),
+                    "Column": mapped,
+                    "prev": old_val,
+                    "new": csv_val
+                })
 
-            issue_key = row_dict.get("Issue key", "")
-            if not issue_key:
+    labels = csv_row.get("Labels", "")
+    new_quarter = ""
+    if "#2026" in labels:
+        new_quarter = "Q1_UTC"
+    elif "#1_p_sm" in labels:
+        new_quarter = "Q1"
+    elif "#2_p_sm" in labels:
+        new_quarter = "Q2"
+    elif "#3_p_sm" in labels:
+        new_quarter = "Q3"
+    elif "#4_p_sm" in labels:
+        new_quarter = "Q4"
+    if new_quarter and new_quarter != "Q1_UTC":
+        new_quarter = f"{new_quarter}_{datetime.datetime.now().strftime('%Y')}"
+    old_quarter = old_row.get("Quarter", "")
+    if new_quarter != old_quarter:
+        record_fields["Quarter"] = new_quarter
+        record_changed = True
+        loggable_change = True
+        changelog.append({
+            "Ticket Number": csv_row.get("Issue key", ""),
+            "Column": "Quarter",
+            "prev": old_quarter,
+            "new": new_quarter
+        })
+
+    new_matrix, old_matrix = unify_matrix_parity(labels, old_row.get("Matrix Parity", ""))
+    if new_matrix != old_matrix:
+        record_fields["Matrix Parity"] = new_matrix
+        record_changed = True
+        loggable_change = True
+        changelog.append({
+            "Ticket Number": csv_row.get("Issue key", ""),
+            "Column": "Matrix Parity",
+            "prev": old_matrix,
+            "new": new_matrix
+        })
+
+    record_fields["Issue key"] = csv_row.get("Issue key", "")
+    record_fields.pop("Labels", None)
+    if record_changed and loggable_change:
+        record_fields["Last Updated (API)"] = last_updated
+
+    return record_changed, loggable_change, record_fields
+
+def compare_new_record(csv_row, fields_to_check, field_mapping, last_updated):
+    record_fields = {}
+    labels = csv_row.get("Labels", "")
+
+    for field in fields_to_check:
+        mapped = field_mapping.get(field, field)
+        csv_val = csv_row.get(mapped, csv_row.get(field, ""))
+
+        if mapped == "Fix versions":
+            csv_val = normalize_fix_versions(csv_val)
+
+        if mapped == "Created" and csv_val:
+            csv_val = convert_created(csv_val)
+
+        if mapped == "Resolution":
+            csv_val = csv_val.strip()
+            if not csv_val:
                 continue
 
-            record_fields = {"Issue key": issue_key}
-            record_changed = False   # Any change for JSON payload
-            loggable_change = False  # Change that should trigger an API update (and changelog)
-
-            if issue_key in old_data:
-                old_row = old_data[issue_key]
-                # Process each field in one loop.
-                for field in fields_to_check:
-                    mapped_field = field_mapping.get(field, field)
-                    csv_val = row_dict.get(mapped_field)
-                    if csv_val is None:
-                        csv_val = row_dict.get(field, "")
-                    if mapped_field == "Fix versions" and csv_val.startswith("smartmls-connectmls-"):
-                        csv_val = re.sub(r"^smartmls-connectmls-", "", csv_val)
-                    # For "Created", convert CSV value to datetime and compare with Airtable value.
-                    if mapped_field == "Created" and csv_val:
-                        try:
-                            dt_csv = datetime.datetime.strptime(csv_val, "%m/%d/%Y %H:%M")
-                        except ValueError:
-                            dt_csv = None
-                        try:
-                            old_created = old_row.get("Created", "")
-                            try:
-                                dt_air = datetime.datetime.strptime(old_created, "%Y-%m-%dT%H:%M:%S.%fZ")
-                            except ValueError:
-                                dt_air = datetime.datetime.strptime(old_created, "%Y-%m-%dT%H:%M:%SZ")
-                        except ValueError:
-                            dt_air = None
-                        if dt_csv and dt_air and dt_csv == dt_air:
-                            csv_val = old_created  # Force CSV value to match Airtable
-                    old_val = old_row.get(mapped_field, "")
-                    if csv_val != old_val:
-                        record_changed = True
-                        record_fields[mapped_field] = csv_val
-                        if mapped_field not in ["Created", "Labels", "Last Updated (API)"]:
-                            loggable_change = True
-                            changes.append({
-                                "Ticket Number": issue_key,
-                                "Column": mapped_field,
-                                "prev": old_val,
-                                "new": csv_val
-                            })
-                # Process Quarter (always loggable)
-                old_quarter = old_row.get("Quarter", "")
-                if new_quarter != old_quarter:
-                    record_fields["Quarter"] = new_quarter
-                    record_changed = True
-                    loggable_change = True
-                    changes.append({
-                        "Ticket Number": issue_key,
-                        "Column": "Quarter",
-                        "prev": old_quarter,
-                        "new": new_quarter
-                    })
-                # Process Matrix Parity (always loggable)
-                old_matrix = old_row.get("Matrix Parity", "")
-                if new_matrix != old_matrix:
-                    record_fields["Matrix Parity"] = new_matrix
-                    record_changed = True
-                    loggable_change = True
-                    changes.append({
-                        "Ticket Number": issue_key,
-                        "Column": "Matrix Parity",
-                        "prev": old_matrix,
-                        "new": new_matrix
-                    })
-                record_fields.pop("Labels", None)
-                # Only add this record if there is a loggable change.
-                if loggable_change:
-                    record_fields["Last Updated (API)"] = today_date
-                    records.append({"fields": record_fields})
-                    changed_rows_count += 1
-            else:
-                # New ticket branch: always include new tickets.
-                new_tickets_count += 1
-                record_fields["Quarter"] = new_quarter
-                record_fields["Matrix Parity"] = new_matrix
-                for field in fields_to_check:
-                    mapped_field = field_mapping.get(field, field)
-                    csv_val = row_dict.get(mapped_field)
-                    if csv_val is None:
-                        csv_val = row_dict.get(field, "")
-                    if mapped_field == "Fix versions" and csv_val.startswith("smartmls-connectmls-"):
-                        csv_val = re.sub(r"^smartmls-connectmls-", "", csv_val)
-                    # For new tickets, leave "Created" as provided.
-                    if mapped_field == "Labels":
-                        record_fields[mapped_field] = csv_val
-                        continue
-                    record_fields[mapped_field] = csv_val
-                record_fields.pop("Labels", None)
-                record_fields["Last Updated (API)"] = today_date
-                records.append({"fields": record_fields})
-                new_ticket_records.append(record_fields)
-
-        if not records:
-            print("There are no differences between the current Airtable data and the data it is being compared to. Exiting the operation.")
-            sys.exit(0)
+        if mapped == "Customer Reported":
+            new_bool, _ = unify_bool(csv_val, False)
+            if new_bool is None:
+                continue
+            record_fields[mapped] = new_bool
         else:
-            print(f"There were {changed_rows_count} changed rows between this Jira export and the current Airtable")
-            print(f"Net new tickets since last export: {new_tickets_count}")
-            print(f"Smart Tickets Not in Jira: {smart_not_count}")
+            record_fields[mapped] = csv_val
 
-        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_backup, _ = os.path.splitext(args.backup)
-        backup_file = f"{base_backup}_{now_str}.xlsx"
-        backup_to_excel(airtable_records, backup_file)
+    new_quarter = ""
+    if "#2026" in labels:
+        new_quarter = "Q1_UTC"
+    elif "#1_p_sm" in labels:
+        new_quarter = "Q1"
+    elif "#2_p_sm" in labels:
+        new_quarter = "Q2"
+    elif "#3_p_sm" in labels:
+        new_quarter = "Q3"
+    elif "#4_p_sm" in labels:
+        new_quarter = "Q4"
+    if new_quarter and new_quarter != "Q1_UTC":
+        new_quarter = f"{new_quarter}_{datetime.datetime.now().strftime('%Y')}"
+    record_fields["Quarter"] = new_quarter
 
-        # Create DataFrames for Excel output.
-        overview_data = [
-            {"": "Tickets with changes since last export", "Count": changed_rows_count},
-            {"": "Net new tickets since last export", "Count": new_tickets_count},
-            {"": "Smart Tickets Not in Jira", "Count": smart_not_count}
+    new_matrix, _ = unify_matrix_parity(labels, False)
+    record_fields["Matrix Parity"] = new_matrix
+
+    record_fields["Issue key"] = csv_row.get("Issue key", "")
+    record_fields.pop("Labels", None)
+    record_fields["Last Updated (API)"] = last_updated
+    return record_fields
+
+def output_excel(excel_path, overview_data, df_changelog, new_data, col_widths):
+    with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+        pd.DataFrame(overview_data).to_excel(writer, sheet_name="Overview", index=False)
+        df_changelog.to_excel(writer, sheet_name="Change Log", index=False)
+
+        if new_data:
+            df_new = pd.DataFrame([nr["fields"] for nr in new_data])
+            df_new.to_excel(writer, sheet_name="New Tickets", index=False)
+
+        workbook = writer.book
+        overview_ws = writer.sheets["Overview"]
+        changes_ws = writer.sheets["Change Log"]
+
+        overview_ws.set_column('A:A', 35)
+        overview_ws.set_column('B:B', 15)
+        changes_ws.set_column('A:A', 16)
+        changes_ws.set_column('B:B', 11)
+        changes_ws.set_column('C:C', 50)
+        changes_ws.set_column('D:D', 50)
+
+        header_format = workbook.add_format({'align': 'left', 'bold': True})
+        if not df_changelog.empty and len(df_changelog.columns) > 0:
+            changes_ws.write(0, 0, df_changelog.columns[0], header_format)
+            changes_ws.write(0, 1, df_changelog.columns[1], header_format)
+
+        band_formats = [
+            workbook.add_format({'bg_color': '#FFFFFF'}),
+            workbook.add_format({'bg_color': '#E6E6E6'})
         ]
-        df_overview = pd.DataFrame(overview_data)
-        df_changes = pd.DataFrame(changes)
 
-        with pd.ExcelWriter(args.excel, engine='xlsxwriter') as writer:
-            df_overview.to_excel(writer, sheet_name="Overview", index=False)
-            df_changes.to_excel(writer, sheet_name="Change Log", index=False)
-            if smart_not_count > 0:
-                df_smart = pd.DataFrame(smart_tickets_not_in_jira)
-                df_smart.to_excel(writer, sheet_name="Smart Tickets Not in Jira", index=False)
-            if new_tickets_count > 0:
-                df_new = pd.DataFrame(new_ticket_records)
-                df_new.to_excel(writer, sheet_name="New Tickets", index=False)
-            
-            workbook = writer.book
-            overview_ws = writer.sheets["Overview"]
-            changes_ws = writer.sheets["Change Log"]
+        prev_ticket = None
+        band_idx = 0
+        for row_idx in range(len(df_changelog)):
+            current_ticket = df_changelog.iloc[row_idx]["Ticket Number"]
+            if current_ticket != prev_ticket:
+                band_idx = 1 - band_idx
+            changes_ws.set_row(row_idx + 1, None, band_formats[band_idx])
+            prev_ticket = current_ticket
 
-            overview_ws.set_column('A:A', 35)
-            overview_ws.set_column('B:B', 15)
-            changes_ws.set_column('A:A', 16)
-            changes_ws.set_column('B:B', 11)
-            changes_ws.set_column('C:C', 50)
-            changes_ws.set_column('D:D', 50)
+        sheet_new = writer.sheets.get("New Tickets")
+        if sheet_new is not None:
+            for i, width in enumerate(col_widths):
+                sheet_new.set_column(i, i, width)
+    print("- Excel workbook written to", excel_path)
 
-            header_format = workbook.add_format({'align': 'left', 'bold': True})
-            if not df_changes.empty and len(df_changes.columns) > 0:
-                changes_ws.write(0, 0, df_changes.columns[0], header_format)
-                changes_ws.write(0, 1, df_changes.columns[1], header_format)
+# -----------------------------
+# GUI Application
+# -----------------------------
+class DiffApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Airtable Diff & Upload")
+        # Change from 600x450 to something wider, e.g. 700x450:
+        self.geometry("710x450")  
+        # Optionally, also set a minimum size to prevent shrinking below a certain width/height:
+        self.minsize(710, 450)
+        self.create_widgets()
 
-            col_widths = [11, 11, 13, 21, 60, 12, 16, 11, 16, 18, 12, 18, 60]
-            smart_sheet = writer.sheets.get("Smart Tickets Not in Jira")
-            if smart_sheet is not None:
-                for i, width in enumerate(col_widths):
-                    smart_sheet.set_column(i, i, width)
-            new_sheet = writer.sheets.get("New Tickets")
-            if new_sheet is not None:
-                for i, width in enumerate(col_widths):
-                    new_sheet.set_column(i, i, width)
+    def create_widgets(self):
+        pad_options = {'padx': 5, 'pady': 5}
+        frame = ttk.Frame(self)
+        frame.pack(fill=tk.BOTH, expand=True)
 
-        print("- Excel workbook written to", args.excel)
+        # Jira Export File (CSV)
+        ttk.Label(frame, text="Jira Export File (CSV):").grid(row=0, column=0, sticky=tk.W, **pad_options)
+        self.jira_csv_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.jira_csv_var, width=50).grid(row=0, column=1, **pad_options)
+        ttk.Button(frame, text="Browse", command=self.browse_jira_csv).grid(row=0, column=2, **pad_options)
 
-        payload = {
-            "performUpsert": {
-                "fieldsToMergeOn": ["Issue key"]
-            },
-            "records": records
+        # Show the Airtable credentials as labels, not editable
+        ttk.Label(frame, text=f"Airtable Base ID: {BASE_ID}").grid(row=1, column=0, columnspan=2, sticky=tk.W, **pad_options)
+        ttk.Label(frame, text=f"Airtable Table ID: {TABLE_ID}").grid(row=2, column=0, columnspan=2, sticky=tk.W, **pad_options)
+        ttk.Label(frame, text=f"Airtable API Token: {API_TOKEN}").grid(row=3, column=0, columnspan=2, sticky=tk.W, **pad_options)
+
+        # Checkboxes for preview and upload-only modes
+        self.preview_var = tk.BooleanVar()
+        ttk.Checkbutton(frame, text="Preview mode (don’t push to Airtable)", variable=self.preview_var).grid(row=4, column=0, columnspan=2, sticky=tk.W, **pad_options)
+
+        self.upload_only_var = tk.BooleanVar()
+        ttk.Checkbutton(frame, text="Upload-only mode (skip diff generation)", variable=self.upload_only_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, **pad_options)
+
+        # Run button
+        ttk.Button(frame, text="Run", command=self.run_process).grid(row=6, column=0, columnspan=3, pady=15)
+
+        # Log output text box
+        ttk.Label(frame, text="Log Output:").grid(row=7, column=0, sticky=tk.W, **pad_options)
+        self.log_text = tk.Text(frame, height=10)
+        self.log_text.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad_options)
+        frame.rowconfigure(8, weight=1)
+
+    def log(self, message):
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        print(message)
+
+    def browse_jira_csv(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Jira Export CSV File",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if file_path:
+            self.jira_csv_var.set(file_path)
+
+    def run_process(self):
+        # Gather inputs from UI
+        jira_csv = self.jira_csv_var.get().strip()
+        preview = self.preview_var.get()
+        upload_only = self.upload_only_var.get()
+
+        # Hard-coded from constants
+        base_id = BASE_ID
+        table_id = TABLE_ID
+        api_token = API_TOKEN
+
+        # Validate required inputs
+        if not jira_csv:
+            messagebox.showerror("Input Error", "Please select the Jira Export file (CSV).")
+            return
+
+        # Auto-generate output filenames based on today's date
+        today = datetime.date.today()
+        excel_out = f"smartMLS_changelog_{today.month}-{today.day}.xlsx"
+        json_out = f"smartMLS_payload_{today.month}-{today.day}.json"
+
+        # Get cwd for output messages
+        working_dir = os.getcwd()
+        excel_full_path = os.path.join(working_dir, excel_out)
+        json_full_path = os.path.join(working_dir, json_out)
+
+        url = f"https://api.airtable.com/v0/{base_id}/{table_id}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
         }
+        last_updated = datetime.datetime.now(datetime.timezone.utc).strftime("%m-%d-%Y %H:%M")
+        json_payload = None
 
-        with open(args.json, "w", encoding="utf-8") as json_file:
-            json.dump(payload, json_file, indent=4)
-        print("- JSON payload written to", args.json)
-
-    else:
-        print("Upload-only mode enabled. Using existing JSON payload from:", args.json)
-        with open(args.json, "r", encoding="utf-8") as json_file:
-            payload = json.load(json_file)
-
-    if args.preview:
-        print("- Preview enabled. Changelog generated but data not pushed to Airtable.\n- Rerun program with the '--upload' flag to push to Airtable.")
-        return
-
-    confirm = input(f"WARNING: Airtable upload triggered. This will modify table '{table_name}' at Base Id '{base_id}'. Type 'yes' or 'y' to proceed: ")
-    if confirm.lower() not in ['yes', 'y']:
-        print("Upload canceled.")
-        sys.exit(0)
-
-    records_list = payload.get("records", [])
-    chunk_size = 10
-
-    for idx, chunk in enumerate(chunks(records_list, chunk_size), start=1):
-        chunk_payload = {
-            "performUpsert": {
-                "fieldsToMergeOn": ["Issue key"]
-            },
-            "records": chunk,
-            "typecast": True  # Enable typecast in case of select fields.
-        }
-        print(f"Sending chunk {idx} with {len(chunk)} records...")
-        response = requests.patch(url, headers=headers, json=chunk_payload)
-        print("Status Code:", response.status_code)
         try:
-            print("Response:", response.json())
-        except json.JSONDecodeError:
-            print("Response could not be decoded as JSON:", response.text)
+            if not upload_only:
+                self.log("Fetching Airtable data...")
+                airtable_records = fetch_airtable_data(url, headers)
+                if airtable_records is None:
+                    return
+
+                duplicate_keys = detect_duplicate_keys(airtable_records)
+                if duplicate_keys:
+                    dup_str = "\n".join(duplicate_keys)
+                    self.log("WARNING: The following duplicate issue keys were found in Airtable and will be skipped:\n" + dup_str)
+
+                old_data = build_old_data(airtable_records)
+                self.log("Reading Jira Export CSV file...")
+                csv_rows = read_and_normalize_csv(jira_csv)
+
+                fields_to_check = [
+                    "Issue Type",
+                    "Summary",
+                    "Status",
+                    "Custom field (T-Shirt Size)",
+                    "Priority",
+                    "Components",
+                    "Custom field (Customer Reported)",
+                    "Fix versions",
+                    "Labels",
+                    "Created",
+                    "Resolution"
+                ]
+                field_mapping = {
+                    "Custom field (T-Shirt Size)": "T-shirt Size",
+                    "Custom field (Customer Reported)": "Customer Reported"
+                }
+
+                changed_records = []
+                new_records = []
+                changelog_entries = []
+                closed_statuses = {"In Prod", "Closed"}
+
+                for row in csv_rows:
+                    issue_key = row.get("Issue key", "")
+                    if not issue_key or issue_key in duplicate_keys:
+                        continue
+                    if issue_key in old_data:
+                        rec_changed, loggable, rec_fields = compare_record(
+                            row, old_data[issue_key],
+                            fields_to_check, field_mapping,
+                            last_updated, changelog_entries
+                        )
+                        if rec_changed and loggable:
+                            changed_records.append({"fields": rec_fields})
+                    else:
+                        status_val = row.get("Status", "").strip()
+                        if status_val in closed_statuses:
+                            continue
+                        new_ticket_fields = compare_new_record(
+                            row, fields_to_check, field_mapping, last_updated
+                        )
+                        new_records.append({"fields": new_ticket_fields})
+
+                total_changed = len(changed_records)
+                total_new = len(new_records)
+                self.log(f"Changed rows: {total_changed}")
+                self.log(f"New tickets: {total_new}")
+
+                if total_changed == 0 and total_new == 0:
+                    messagebox.showinfo("No Changes", "There are no differences. Exiting operation.")
+                    return
+
+                # Create backup file (auto-generated)
+                now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_file = f"{os.path.splitext('airtable_backup.xlsx')[0]}_{now_str}.xlsx"
+                backup_file_full_path = os.path.join(working_dir, backup_file)
+                self.log("Creating Airtable backup...")
+                backup_to_excel(airtable_records, backup_file)
+                self.log(f"Backup file created at: {backup_file_full_path}")
+
+                # Generate Excel changelog
+                overview_data = [
+                    {"": "Tickets with changes since last export", "Count": total_changed},
+                    {"": "Net new tickets since last export", "Count": total_new}
+                ]
+                df_changelog = pd.DataFrame(changelog_entries)
+                col_widths = [11, 11, 13, 21, 60, 12, 16, 11, 16, 18, 12, 18, 60]
+                self.log("Generating Excel change log...")
+                output_excel(excel_out, overview_data, df_changelog, new_records, col_widths)
+                self.log(f"Change log generated at: {excel_full_path} ")
+
+                # Write JSON payload
+                json_payload = {
+                    "performUpsert": {"fieldsToMergeOn": ["Issue key"]},
+                    "records": changed_records + new_records
+                }
+                with open(json_out, "w", encoding="utf-8") as jf:
+                    json.dump(json_payload, jf, indent=4)
+                self.log("JSON payload generated at: " + json_full_path)
+            else:
+                # Upload-only mode: use existing JSON file
+                self.log("Upload-only mode enabled. Loading existing JSON payload...")
+                if not os.path.exists(json_out):
+                    messagebox.showerror("Missing File", f"JSON file '{json_out}' not found for upload-only mode.")
+                    return
+                with open(json_out, "r", encoding="utf-8") as jf:
+                    json_payload = json.load(jf)
+
+            if preview:
+                self.log("Preview mode enabled. No data will be pushed to Airtable.")
+                messagebox.showinfo("Preview Mode", "Changelog generated but data not pushed to Airtable.\nRerun without preview mode to push changes.")
+                return
+
+            # Final confirmation
+            warn_msg = (
+                f"WARNING: Airtable upload triggered.\n"
+                f"This will modify table '{table_id}' at Base ID '{base_id}'.\n"
+                f"Do you want to proceed?"
+            )
+            if not messagebox.askyesno("Confirm Upload", warn_msg):
+                self.log("Upload canceled by user.")
+                return
+
+            records_list = json_payload.get("records", [])
+            chunk_size = 10
+            for idx, chunk in enumerate(chunks(records_list, chunk_size), start=1):
+                chunk_payload = {
+                    "performUpsert": {"fieldsToMergeOn": ["Issue key"]},
+                    "records": chunk,
+                    "typecast": True
+                }
+                self.log(f"Uploading chunk {idx} with {len(chunk)} records...")
+                response = requests.patch(url, headers=headers, json=chunk_payload)
+                self.log("Status Code: " + str(response.status_code))
+                try:
+                    self.log("Response: " + str(response.json()))
+                except json.JSONDecodeError:
+                    self.log("Response could not be decoded as JSON: " + response.text)
+            self.log("Upload complete.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self.log("Error: " + str(e))
 
 if __name__ == '__main__':
-    main()
+    app = DiffApp()
+    app.mainloop()
