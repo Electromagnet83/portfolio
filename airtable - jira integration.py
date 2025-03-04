@@ -1,3 +1,7 @@
+# This code is designed to provide  GUI interface in which users can specify a Jira export file. 
+# On the back end, the script will pull data out of airtable, diff it with the jira export (as the source of truth), and write the appropriate airtable data set. 
+# It provides a way to give customers visibility into tickets you own, without providing access to Jira. 
+
 #!/usr/bin/env python
 import re
 import csv
